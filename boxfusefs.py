@@ -5,13 +5,25 @@ from __future__ import with_statement
 import os
 import sys
 import errno
+import argparse
+import code
+import pprint
+import json
 
-from fuse import FUSE, FuseOSError, Operations
+from fusepy import FUSE, FuseOSError, Operations
+from boxsdk import OAuth2, Client
 
+TOKENS_DIR="./tokens"
+TOKENS_FILE=TOKENS_DIR+"/tokens"
+APP_CLIENTID="rbowlcj4sc7u96dfxprgd26bhqwt5nlz"
+APP_SECRET="Huiq0x7vxFgKjpAlp9k0WAcLxQ1Efmjh"
+APP_ACCESS_TOKEN=""
+LOGFILE='/tmp/fs.log'
 
-class Passthrough(Operations):
-    def __init__(self, root):
-        self.root = root
+class BoxFuseFS(Operations):
+    def __init__(self):
+        self.root = "/code"
+        self.log('Starting')
 
     # Helpers
     # =======
@@ -21,6 +33,12 @@ class Passthrough(Operations):
             partial = partial[1:]
         path = os.path.join(self.root, partial)
         return path
+
+    def log(self,message):
+        l = open(LOGFILE,'a')
+        l.write(message+'\n')
+        l.close()
+        pass
 
     # Filesystem methods
     # ==================
@@ -39,12 +57,16 @@ class Passthrough(Operations):
         return os.chown(full_path, uid, gid)
 
     def getattr(self, path, fh=None):
+        self.log("getattr " +path)
         full_path = self._full_path(path)
         st = os.lstat(full_path)
-        return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
-                     'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
+        return_val = dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime', 
+            'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
+        self.log("getattr " +path+ "\n"+pprint.pformat(return_val))
+        return return_val
 
     def readdir(self, path, fh):
+        self.log("readdir " +path)
         full_path = self._full_path(path)
 
         dirents = ['.', '..']
@@ -54,6 +76,7 @@ class Passthrough(Operations):
             yield r
 
     def readlink(self, path):
+        self.log("readlink " +path)
         pathname = os.readlink(self._full_path(path))
         if pathname.startswith("/"):
             # Path name is absolute, sanitize it.
@@ -72,6 +95,7 @@ class Passthrough(Operations):
         return os.mkdir(self._full_path(path), mode)
 
     def statfs(self, path):
+        self.log("statfs " +path)
         full_path = self._full_path(path)
         stv = os.statvfs(full_path)
         return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
@@ -97,6 +121,7 @@ class Passthrough(Operations):
     # ============
 
     def open(self, path, flags):
+        self.log("open " +path)
         full_path = self._full_path(path)
         return os.open(full_path, flags)
 
@@ -105,6 +130,7 @@ class Passthrough(Operations):
         return os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
 
     def read(self, path, length, offset, fh):
+        self.log("read " +path+" length: "+length+ " offset: "+offset)
         os.lseek(fh, offset, os.SEEK_SET)
         return os.read(fh, length)
 
@@ -118,17 +144,80 @@ class Passthrough(Operations):
             f.truncate(length)
 
     def flush(self, path, fh):
+        self.log("flush " +path)
         return os.fsync(fh)
 
     def release(self, path, fh):
+        self.log("release " +path)
         return os.close(fh)
 
     def fsync(self, path, fdatasync, fh):
+        self.log("fsync " +path)
         return self.flush(path, fh)
 
 
-def main(mountpoint, root):
-    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=True)
+def main(mountpoint):
+    FUSE(BoxFuseFS(), mountpoint, nothreads=True, foreground=True)
+
+
+def store_tokens(access_token, refresh_token):
+    # store the tokens at secure storage (e.g. Keychain)
+    print ("store token\naccess_token: "+access_token+"\nrefresh_token:"+refresh_token)
+    data = { "access_token": access_token,
+            "refresh_token": refresh_token
+    }
+    with open(TOKENS_FILE, "w") as write_file:
+        json.dump(data, write_file)
+
+
+def authenticate_with_box():
+    print ("Authenticate with box")
+    client = None
+    oauth = OAuth2(
+        client_id=APP_CLIENTID,
+        client_secret=APP_SECRET,
+        store_tokens=store_tokens,
+    )
+
+    auth_url, csrf_token = oauth.get_authorization_url('https://github.com/r00k135/boxfusefs/wiki/authenticated')
+    print ("Navigate to this URL in a browser: "+auth_url)
+    auth_code = input("Type the value from the result URL and the code= parameter in here: ")
+    APP_ACCESS_TOKEN, refresh_token = oauth.authenticate(auth_code)    
+    return oauth
+
 
 if __name__ == '__main__':
-    main(sys.argv[2], sys.argv[1])
+    # Check parameters
+    parser = argparse.ArgumentParser(description='Box.com Fuse Filesystem')
+    parser.add_argument('mountpoint', metavar="mountpoint", help='mountpoint')
+    args = parser.parse_args()
+    # print (args)
+    # check .tokens directory exists
+    if os.path.exists(TOKENS_DIR) == False:
+        try:
+            os.makedirs(TOKENS_DIR)
+        except OSError:
+            print ("unable to create "+TOKENS_DIR+" directory")
+            exit (1)
+    # See if token file exists
+    oauth = None
+    client = None
+    if os.path.isfile(TOKENS_FILE):
+        print ("Loading saved access_token")
+        with open(TOKENS_FILE) as data_file:    
+            data = json.load(data_file)
+            #print (pprint.pprint(data))
+            try:
+                APP_ACCESS_TOKEN = data["access_token"]
+                oauth = OAuth2(APP_CLIENTID, APP_SECRET, access_token=APP_ACCESS_TOKEN)
+            except:
+                oauth = authenticate_with_box()  
+    else:
+       oauth = authenticate_with_box() 
+
+    print ("Starting client")
+    client = Client(oauth)
+    me = client.user(user_id='me').get()
+    print ('user_login: ' + me['login'])
+    main(args.mountpoint)
+    code.interact(local=locals())
