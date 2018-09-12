@@ -13,6 +13,8 @@ import stat
 import fuse
 import fusepy
 import time
+import urllib3
+import requests
 
 from fusepy import FUSE, FuseOSError, Operations
 from boxsdk import OAuth2, Client
@@ -26,6 +28,8 @@ LOGFILE='/tmp/fs.log'
 UID=os.geteuid()
 GID=os.getgid()
 
+http_pool = urllib3.PoolManager()
+
 start_time = time.time()
 folder_cache = { 
     '/': {
@@ -35,40 +39,23 @@ folder_cache = {
         'st_atime': start_time,
         'st_ctime': start_time,
         'st_mtime': start_time,
+        'st_ino': 0,
+        'st_dev': 0,
         'st_gid': GID,
-        'st_mode': stat.S_IFDIR | 0o555,
+        'st_mode': stat.S_IFDIR | 0o777,
         'st_nlink': 2,
         'st_uid': UID
     }
 }
+http_object_cache = {}
 
-
-class MyStat(fusepy.c_stat):
-    def __init__(self):
-        self.st_mode = stat.S_IFDIR | 0o755
-        self.st_ino = 0
-        self.st_dev = 0
-        self.st_nlink = 2
-        self.st_uid = 0
-        self.st_gid = 0
-        self.st_size = 4096
-        self.st_atime = 0
-        self.st_mtime = 0
-        self.st_ctime = 0
 
 class BoxFuseFS(Operations):
     def __init__(self):
-        self.root = "/code"
         self.log('Starting')
 
     # Helpers
     # =======
-
-    def _full_path(self, partial):
-        if partial.startswith("/"):
-            partial = partial[1:]
-        path = os.path.join(self.root, partial)
-        return path
 
     def log(self,message):
         l = open(LOGFILE,'a')
@@ -80,33 +67,26 @@ class BoxFuseFS(Operations):
     # ==================
 
     def access(self, path, mode):
-        full_path = self._full_path(path)
-        if not os.access(full_path, mode):
-            raise FuseOSError(errno.EACCES)
+        self.log("access " +path)
+        return 0
 
     def chmod(self, path, mode):
-        full_path = self._full_path(path)
-        return os.chmod(full_path, mode)
+        self.log("chmod " +path)
+        return 0
 
     def chown(self, path, uid, gid):
-        full_path = self._full_path(path)
-        return os.chown(full_path, uid, gid)
+        self.log("chown " +path)
+        return 0
 
     def getattr(self, path, fh=None):
         self.log("getattr " +path)
-        #st = MyStat()
-        #pe = path.split('/')[1:]
-
-        #st.st_atime = int(time())
-        #st.st_mtime = st.st_atime
-        #st.st_ctime = st.st_atime
-        #return_val = dict((st))
-        #self.log("getattr " +path+ "\n"+pprint.pformat(return_val))
-        #return return_val
+        if path != "/" and len(folder_cache) == 1:
+            self.log("getattr " +path+ " first read of root")
+            self.populateFolderCache("/")
         if path in folder_cache:
             if 'st_size' in folder_cache[path]:
                 return_val = folder_cache[path]
-                self.log("getattr " +path+ "\n"+pprint.pformat(return_val))
+                self.log("getattr "+path+" "+pprint.saferepr(return_val))
                 return return_val
             else:
                 self.log("getattr boxid: "+str(folder_cache[path]["boxid"]))
@@ -116,23 +96,37 @@ class BoxFuseFS(Operations):
                 folder_cache[path]["st_mtime"] = time.mktime(time.strptime(file_query["modified_at"], "%Y-%m-%dT%H:%M:%S-07:00"))
                 folder_cache[path]["st_atime"] = time.time()
                 return_val = folder_cache[path]
-                self.log("getattr " +path+ "\n"+pprint.pformat(return_val))
+                self.log("getattr " +path+ " "+pprint.saferepr(return_val))
                 return return_val
-
         else:
-            return -errno.ENOSYS
+            # Not in cache, try populateFolderCache one direcory up
+            oneback = path.split("/")
+            oneback.pop()
+            oneback.reverse()
+            oneback.pop()
+            oneback.reverse()
+            self.log("getattr " +path+ " oneback: "+pprint.saferepr(oneback))
+            if len(oneback) > 0:
+                searchpath = ""
+                for element in oneback:
+                    searchpath += "/"+element
+                self.log("getattr " +path+ " searchpath: "+searchpath)
+                self.populateFolderCache(searchpath)
+                if path in folder_cache:
+                    return_val = folder_cache[path]
+                    self.log("getattr " +path+ " "+pprint.saferepr(return_val))
+                    return return_val
+                else:
+                    self.log("getattr " +path+ " ENOENT (Not Found) - folder not found")
+                    raise FuseOSError(errno.ENOENT)
+                    return {}
+            else:
+                self.log("getattr " +path+ " ENOENT (Not Found) - oneback empty")
+                raise FuseOSError(errno.ENOENT)
+                return {}
 
-        #full_path = self._full_path(path)
-        #st = os.lstat(full_path)
-        #self.log("getattr " +path+ "\n"+pprint.pformat(st))
-        #return_val = dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime', 
-        #    'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
-        #self.log("getattr " +path+ "\n"+pprint.pformat(return_val))
-        #return return_val
-
-    def readdir(self, path, fh):
-        self.log("readdir " +path)
-        full_path = self._full_path(path)
+    def populateFolderCache(self, path):
+        self.log("populateFolderCache " +path)
         folder_id = folder_cache[path]["boxid"]
 
         translated_path = ""
@@ -145,16 +139,17 @@ class BoxFuseFS(Operations):
         self.log("readdir " +path+" len: "+str(length))
         item = 0
         while item < length:
+            #self.log("readdir item "+str(item))
             fileItem = folder_query[item]
             newPath = translated_path+"/"+fileItem["name"]
             folder_cache[newPath] = dict()
             if fileItem["type"] == "folder":
                 folder_cache[newPath]['st_size'] = 4096
-                folder_cache[newPath]['st_mode'] = stat.S_IFDIR | 0o555
+                folder_cache[newPath]['st_mode'] = stat.S_IFDIR | 0o777
                 folder_cache[newPath]['st_nlink'] = 2
             if fileItem["type"] == "file":
                 folder_cache[newPath]['st_size'] = fileItem["size"]
-                folder_cache[newPath]['st_mode'] = stat.S_IFREG | 0o555
+                folder_cache[newPath]['st_mode'] = stat.S_IFREG | 0o777
                 folder_cache[newPath]['st_nlink'] = 1
             folder_cache[newPath]["boxid"] = fileItem["id"]
             folder_cache[newPath]["type"] = fileItem["type"]
@@ -163,91 +158,94 @@ class BoxFuseFS(Operations):
             folder_cache[newPath]["st_mtime"] = time.mktime(time.strptime(fileItem["modified_at"], "%Y-%m-%dT%H:%M:%S-07:00"))
             folder_cache[newPath]["st_gid"] = GID
             folder_cache[newPath]["st_uid"] = UID
-            self.log("readdir item "+str(item))
+            folder_cache[newPath]["st_ino"] = 0
+            folder_cache[newPath]["st_dev"] = 0
             dirents.append(fileItem["name"]) 
             item = item + 1
-        #if os.path.isdir(full_path):
-        #    dirents.extend(os.listdir(full_path))
-        self.log("dirents " +path+ "\n"+pprint.pformat(dirents))
+        self.log("populateFolderCache " +path+ " dirents: "+pprint.pformat(dirents))
+        return dirents
+
+    def readdir(self, path, fh=None):
+        self.log("readdir " +path)
+        dirents = self.populateFolderCache(path)
         for r in dirents:
             yield r
 
     def readlink(self, path):
         self.log("readlink " +path)
-        pathname = os.readlink(self._full_path(path))
-        if pathname.startswith("/"):
-            # Path name is absolute, sanitize it.
-            return os.path.relpath(pathname, self.root)
-        else:
-            return pathname
+        return path
 
     def mknod(self, path, mode, dev):
-        return os.mknod(self._full_path(path), mode, dev)
+        return 0
 
     def rmdir(self, path):
-        full_path = self._full_path(path)
-        return os.rmdir(full_path)
+        return 0
 
     def mkdir(self, path, mode):
-        return os.mkdir(self._full_path(path), mode)
+        return 0
 
     def statfs(self, path):
         self.log("statfs " +path)
-        full_path = self._full_path(path)
-        stv = os.statvfs(full_path)
         return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
             'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
             'f_frsize', 'f_namemax'))
 
     def unlink(self, path):
-        return os.unlink(self._full_path(path))
+        return 0
 
     def symlink(self, name, target):
-        return os.symlink(name, self._full_path(target))
+        return 0
 
     def rename(self, old, new):
-        return os.rename(self._full_path(old), self._full_path(new))
+        return 0
 
     def link(self, target, name):
-        return os.link(self._full_path(target), self._full_path(name))
+        return 0
 
     def utimens(self, path, times=None):
-        return os.utime(self._full_path(path), times)
+        return 0
 
     # File methods
     # ============
 
     def open(self, path, flags):
         self.log("open " +path)
-        #full_path = self._full_path(path)
-        #return os.open(full_path, flags)
-        return int(folder_cache[path]["boxid"])
+        return 0
 
     def create(self, path, mode, fi=None):
-        full_path = self._full_path(path)
-        return os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
+        self.log("create " +path)
+        return 0
 
     def read(self, path, length, offset, fh):
         self.log("read " +path+" length: "+str(length)+ " offset: "+str(offset)+" fh: "+str(fh))
-        os.lseek(fh, offset, os.SEEK_SET)
-        return os.read(fh, length)
+        boxid = folder_cache[path]["boxid"]
+        headers = {
+            'Authorization': 'Bearer '+oauth.access_token,
+            'Range': 'bytes='+str(offset)+"-"+str(offset+(length-1))
+        }
+        self.log("read " +path+" headers: "+pprint.saferepr(headers))
+        r = requests.get('https://api.box.com/2.0/files/'+str(boxid)+'/content', headers=headers)
+        return r.content
 
     def write(self, path, buf, offset, fh):
         os.lseek(fh, offset, os.SEEK_SET)
         return os.write(fh, buf)
 
     def truncate(self, path, length, fh=None):
-        full_path = self._full_path(path)
-        with open(full_path, 'r+') as f:
-            f.truncate(length)
+        return 0
 
     def flush(self, path, fh):
         self.log("flush " +path)
-        return os.fsync(fh)
+        return 0
 
     def release(self, path, fh):
         self.log("release " +path)
-        return os.close(fh)
+        if path in http_object_cache:
+            if http_object_cache[path]["responseObj"]:
+                self.log("release " +path+" http_object_cache")
+                http_object_cache[path]["responseObj"].close()
+                http_object_cache[path] = None
+        return 0
 
     def fsync(self, path, fdatasync, fh):
         self.log("fsync " +path)
@@ -320,5 +318,6 @@ if __name__ == '__main__':
     client = Client(oauth)
     me = client.user(user_id='me').get()
     print ('user_login: ' + me['login'])
+    # Populate root directory
     main(args.mountpoint)
     code.interact(local=locals())

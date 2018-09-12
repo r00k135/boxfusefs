@@ -17,7 +17,9 @@ Provides a "Client ID" and "Client Secret"
 
 ## Pre-requitis
 
+Urllib3: https://github.com/urllib3/urllib3
 Box Python SDK: https://github.com/box/box-python-sdk
 Box Python SDK Intro: http://opensource.box.com/box-python-sdk/tutorials/intro.html
+Box API: https://developer.box.com/v2.0/reference
 
 
