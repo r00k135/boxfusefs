@@ -3,7 +3,7 @@ Box Fuse FileSystem - this filesystem allows you mount a box account as a fuse f
 
 ## Install
 
-git clone <this repo>
+git clone <<this repo>>
 
 ### Ubuntu
 Install python3 and dependent modules
@@ -17,7 +17,7 @@ Provides a "Client ID" and "Client Secret"
 
 ## Run (as non-root user)
 
-./standalone.sh <mount>
+./standalone.sh <<mount point>>
 
 First time you fun this will prompt you to log-in to box and ask you to authorise the app. This runs in the foreground so when you exit the process it unmounts the filesystem. To exit press CTRL-C and then it exits into an interactive python prompt, the press CTRL-D to exit completely.
 
