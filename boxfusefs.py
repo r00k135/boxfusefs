@@ -15,6 +15,7 @@ import fusepy
 import time
 import urllib3
 import requests
+import certifi
 
 from fusepy import FUSE, FuseOSError, Operations
 from boxsdk import OAuth2, Client
@@ -28,7 +29,32 @@ LOGFILE='/tmp/fs.log'
 UID=os.geteuid()
 GID=os.getgid()
 
-http_pool = urllib3.PoolManager()
+#http_pool = urllib3.HTTPConnectionPool(host='api.box.com', port=443, maxsize=20,
+#    cert_reqs='CERT_REQUIRED',
+#    ca_certs=certifi.where(),
+#    assert_same_host=False)
+
+http_pool_headers = urllib3.make_headers(
+    keep_alive=True, 
+    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36"
+    )
+#http_pool_api = urllib3.connection_from_url('https://api.box.com',
+#    cert_reqs='CERT_REQUIRED',
+#    ca_certs=certifi.where(),
+#    headers=http_pool_headers,
+#    maxsize=10,
+#    block=False)
+
+#http_pool_dl = urllib3.connection_from_url('https://dl.boxcloud.com',
+#    cert_reqs='CERT_REQUIRED',
+#    ca_certs=certifi.where(),
+#    headers=http_pool_headers,
+#    maxsize=10,
+#    block=False)
+
+http_pool_mgr = urllib3.PoolManager(10,
+    headers=http_pool_headers,
+    block=False)
 
 start_time = time.time()
 folder_cache = { 
@@ -47,7 +73,7 @@ folder_cache = {
         'st_uid': UID
     }
 }
-http_object_cache = {}
+redirect_cache = {}
 
 
 class BoxFuseFS(Operations):
@@ -71,11 +97,13 @@ class BoxFuseFS(Operations):
         return 0
 
     def chmod(self, path, mode):
-        self.log("chmod " +path)
+        self.log("chmod " +path+" access denied")
+        raise FuseOSError(errno.EACCES)
         return 0
 
     def chown(self, path, uid, gid):
-        self.log("chown " +path)
+        self.log("chown " +path+" access denied")
+        raise FuseOSError(errno.EACCES)
         return 0
 
     def getattr(self, path, fh=None):
@@ -179,27 +207,47 @@ class BoxFuseFS(Operations):
         return 0
 
     def rmdir(self, path):
+        self.log("rmdir " +path+" access denied")
+        raise FuseOSError(errno.EACCES)
         return 0
 
     def mkdir(self, path, mode):
+        self.log("mkdir " +path+" access denied")
+        raise FuseOSError(errno.EACCES)
         return 0
 
     def statfs(self, path):
         self.log("statfs " +path)
-        return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
-            'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
-            'f_frsize', 'f_namemax'))
+        return {
+            'f_bavail': 0,
+            'f_bfree:': 0,
+            'f_blocks': 4,
+            'f_bsize': 1024,
+            'f_favail': 0,
+            'f_ffree': 0,
+            'f_files': 1,
+            'f_frsize': 512,
+            'f_namelen': 255
+        }
 
     def unlink(self, path):
+        self.log("unlink " +path+" access denied")
+        raise FuseOSError(errno.EACCES)
         return 0
 
     def symlink(self, name, target):
+        self.log("symlink " +path+" access denied")
+        raise FuseOSError(errno.EACCES)
         return 0
 
     def rename(self, old, new):
+        self.log("rename " +path+" access denied")
+        raise FuseOSError(errno.EACCES)
         return 0
 
     def link(self, target, name):
+        self.log("link " +path+" access denied")
+        raise FuseOSError(errno.EACCES)
         return 0
 
     def utimens(self, path, times=None):
@@ -213,19 +261,36 @@ class BoxFuseFS(Operations):
         return 0
 
     def create(self, path, mode, fi=None):
-        self.log("create " +path)
+        self.log("create " +path+" access denied")
+        raise FuseOSError(errno.EACCES)
         return 0
 
     def read(self, path, length, offset, fh):
-        self.log("read " +path+" length: "+str(length)+ " offset: "+str(offset)+" fh: "+str(fh))
+        self.log("read " +path+" length: "+str(length)+ " offset: "+str(offset))
         boxid = folder_cache[path]["boxid"]
-        headers = {
-            'Authorization': 'Bearer '+oauth.access_token,
-            'Range': 'bytes='+str(offset)+"-"+str(offset+(length-1))
-        }
-        self.log("read " +path+" headers: "+pprint.saferepr(headers))
-        r = requests.get('https://api.box.com/2.0/files/'+str(boxid)+'/content', headers=headers)
-        return r.content
+        data = ""
+        headers = { 
+            'Authorization': 'Bearer '+oauth.access_token, 
+            'Range': 'bytes='+str(offset)+"-"+str(offset+(length-1)), 
+            'Connection': 'keep-alive', 
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36' 
+            }
+        start_time = time.time()
+        if path in redirect_cache:
+            self.log("read " +path+" redirect cached")
+        else:
+            self.log("read " +path+" getting redirect")
+            r_api = http_pool_mgr.request('GET', 'https://api.box.com/2.0/files/'+str(boxid)+'/content', headers=headers, redirect=False)
+            redirect_cache[path] = r_api.headers["Location"]
+            #r_api.release_conn()
+        r_dl = http_pool_mgr.request('GET', redirect_cache[path], headers=headers, preload_content=False)
+        data = r_dl.read()
+        #r_dl.release_conn()
+        # get end time
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        self.log("read " +path+" ELAPSED: "+str(round(elapsed_time, 4)))
+        return data
 
     def write(self, path, buf, offset, fh):
         os.lseek(fh, offset, os.SEEK_SET)
@@ -240,11 +305,6 @@ class BoxFuseFS(Operations):
 
     def release(self, path, fh):
         self.log("release " +path)
-        if path in http_object_cache:
-            if http_object_cache[path]["responseObj"]:
-                self.log("release " +path+" http_object_cache")
-                http_object_cache[path]["responseObj"].close()
-                http_object_cache[path] = None
         return 0
 
     def fsync(self, path, fdatasync, fh):
@@ -253,7 +313,7 @@ class BoxFuseFS(Operations):
 
 
 def main(mountpoint):
-    FUSE(BoxFuseFS(), mountpoint, nothreads=True, foreground=True, allow_other=True)
+    FUSE(BoxFuseFS(), mountpoint, nothreads=False, foreground=True, allow_other=True, max_readahead=262144, max_read=262144)
 
 
 def store_tokens(access_token, refresh_token):
